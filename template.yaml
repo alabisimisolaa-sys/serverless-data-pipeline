@@ -1,0 +1,201 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Serverless event-driven CSV ingestion pipeline. Compatible with the AWS Academy
+  sandbox: creates no IAM roles and uses the pre-provisioned LabRole for Lambda.
+  Services used: S3, SQS, Lambda, DynamoDB, SNS, CloudWatch.
+
+Parameters:
+  NotificationEmail:
+    Type: String
+    Description: Email address that receives a notification each time a file is processed.
+
+Resources:
+
+  RecordsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'pipeline-records-${AWS::StackName}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: recordId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: recordId
+          KeyType: HASH
+
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'pipeline-notify-${AWS::StackName}'
+
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref NotificationTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub 'pipeline-dlq-${AWS::StackName}'
+      MessageRetentionPeriod: 1209600
+
+  ProcessingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub 'pipeline-queue-${AWS::StackName}'
+      VisibilityTimeout: 360
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
+        maxReceiveCount: 3
+
+  # Allows S3 to send object-created events to the queue. This is a queue
+  # resource policy, not an IAM role, so it is permitted in the sandbox.
+  QueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref ProcessingQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowS3SendMessage
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt ProcessingQueue.Arn
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub 'arn:aws:s3:::pipeline-raw-${AWS::AccountId}-${AWS::Region}'
+
+  RawBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: QueuePolicy
+    Properties:
+      BucketName: !Sub 'pipeline-raw-${AWS::AccountId}-${AWS::Region}'
+      NotificationConfiguration:
+        QueueConfigurations:
+          - Event: s3:ObjectCreated:*
+            Queue: !GetAtt ProcessingQueue.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: incoming/
+                  - Name: suffix
+                    Value: .csv
+
+  ProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'pipeline-processor-${AWS::StackName}'
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/LabRole'
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref RecordsTable
+          TOPIC_ARN: !Ref NotificationTopic
+      Code:
+        ZipFile: |
+          import json, os, csv, io, uuid, boto3
+          s3 = boto3.client('s3')
+          ddb = boto3.resource('dynamodb')
+          sns = boto3.client('sns')
+          TABLE = os.environ['TABLE_NAME']
+          TOPIC = os.environ['TOPIC_ARN']
+
+          def handler(event, context):
+              table = ddb.Table(TABLE)
+              total = 0
+              for record in event['Records']:
+                  body = json.loads(record['body'])
+                  for s3rec in body.get('Records', []):
+                      bucket = s3rec['s3']['bucket']['name']
+                      key = s3rec['s3']['object']['key']
+                      if not key.lower().endswith('.csv'):
+                          continue
+                      obj = s3.get_object(Bucket=bucket, Key=key)
+                      text = obj['Body'].read().decode('utf-8')
+                      rows = list(csv.DictReader(io.StringIO(text)))
+                      if not rows:
+                          raise ValueError('No rows parsed from ' + key)
+                      with table.batch_writer() as batch:
+                          for row in rows:
+                              item = {k: v for k, v in row.items() if v not in (None, '')}
+                              item['recordId'] = str(uuid.uuid4())
+                              item['sourceFile'] = key
+                              batch.put_item(Item=item)
+                      total += len(rows)
+                      name = key.split('/')[-1]
+                      s3.copy_object(Bucket=bucket,
+                                     CopySource={'Bucket': bucket, 'Key': key},
+                                     Key='processed/' + name)
+                      sns.publish(TopicArn=TOPIC,
+                                  Subject='Pipeline: file processed',
+                                  Message='Processed ' + str(len(rows)) + ' records from ' + key)
+              print('Total records processed:', total)
+              return {'processed': total}
+
+  EventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 10
+      EventSourceArn: !GetAtt ProcessingQueue.Arn
+      FunctionName: !Ref ProcessorFunction
+      Enabled: true
+
+  ErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'pipeline-errors-${AWS::StackName}'
+      AlarmDescription: Fires when the processor Lambda reports one or more errors.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ProcessorFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref NotificationTopic
+
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub 'pipeline-${AWS::StackName}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {"type":"metric","x":0,"y":0,"width":12,"height":6,
+             "properties":{"title":"Lambda invocations and errors","region":"${AWS::Region}","stat":"Sum","period":60,
+               "metrics":[
+                 ["AWS/Lambda","Invocations","FunctionName","${ProcessorFunction}"],
+                 ["AWS/Lambda","Errors","FunctionName","${ProcessorFunction}"]
+               ]}},
+            {"type":"metric","x":12,"y":0,"width":12,"height":6,
+             "properties":{"title":"Queue depth (main vs DLQ)","region":"${AWS::Region}","stat":"Average","period":60,
+               "metrics":[
+                 ["AWS/SQS","ApproximateNumberOfMessagesVisible","QueueName","${ProcessingQueue.QueueName}"],
+                 ["AWS/SQS","ApproximateNumberOfMessagesVisible","QueueName","${DeadLetterQueue.QueueName}"]
+               ]}}
+          ]
+        }
+
+Outputs:
+  RawBucketName:
+    Description: Upload test CSV files under the incoming/ prefix of this bucket.
+    Value: !Ref RawBucket
+  DynamoTableName:
+    Value: !Ref RecordsTable
+  SnsTopicArn:
+    Value: !Ref NotificationTopic
+  DashboardName:
+    Value: !Sub 'pipeline-${AWS::StackName}'
