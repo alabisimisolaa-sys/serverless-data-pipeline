@@ -1,0 +1,8 @@
+"recordId","amount","email","id","name","price","product","signupDate","sourceFile"
+"448b3d3b-d9f1-4e56-8c11-0e357f4a1a4d","200.00","grace@example.com","","Grace Hopper","","","2026-05-03","incoming/sample-data.csv"
+"34b301d6-66e2-4ae8-a0b8-38a68bcb8b0b","75.00","alan@example.com","","Alan Turing","","","2026-05-02","incoming/sample-data.csv"
+"f1ef67d0-f185-43b5-8015-d9faa6af1eb1","150.25","katherine@example.com","","Katherine Johnson","","","2026-05-04","incoming/sample-data.csv"
+"7d7b45e7-fd0c-487a-8791-1b54b5cee87e","","","101","","25.99","Wireless Mouse","","incoming/test-orders.csv"
+"7844e8ea-bf6c-4397-9fb2-3c0dff7548db","120.50","ada@example.com","","Ada Lovelace","","","2026-05-01","incoming/sample-data.csv"
+"cd4bffcb-5a7f-4f93-b3bb-eb9212d6cc68","","","103","","45.00","USB-C Hub","","incoming/test-orders.csv"
+"61800665-c8f9-45bb-8a08-1fb108d401b3","","","102","","89.50","Mechanical Keyboard","","incoming/test-orders.csv"
