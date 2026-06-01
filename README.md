@@ -13,6 +13,16 @@ The pipeline implements a decoupled ingest-process-notify architecture:
    * If an unhandled exception or corrupt schema is encountered, the message retries 3 times before being safely isolated into an **SQS Dead-Letter Queue (DLQ)**.
    * A **CloudWatch Alarm** watches the Lambda error metric and triggers a high-priority SNS alert.
 
+flowchart LR
+    U[CSV Upload] --> S3_In[(S3 Bucket: incoming/)]
+    S3_In -- ObjectCreated Event --> SQS_Q[SQS Main Queue]
+    SQS_Q --> Lambda[Lambda Processor]
+    Lambda --> DDB[(DynamoDB Table)]
+    Lambda --> S3_Out[(S3 Bucket: processed/)]
+    Lambda --> SNS[SNS Topic] --> Email[Email Alert]
+    SQS_Q -- Max Receives Exceeded --> DLQ[Dead-Letter Queue]
+    Lambda -. Error Metric .-> CW[CloudWatch Error Alarm]
+
 ##  Skills & Architectural Strategy ("Why I Built It This Way")
 
 * **Decoupling with SQS:** Placing a message queue between S3 and Lambda buffers spiky workloads. If downstream processing slows down or experiences an outage, messages sit safely in flight rather than failing silently.
