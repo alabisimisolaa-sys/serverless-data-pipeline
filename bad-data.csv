@@ -1,0 +1,3 @@
+id,product,price
+NOT_A_VALID_NUMBER, Broken Row Here, missing_price
+CORRUPT_DATA_LINE_WITHOUT_COMMAS_OR_VALUES
